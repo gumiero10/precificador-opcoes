@@ -1,0 +1,801 @@
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import * as Plotly from "plotly";
+
+/* ═══════════════════════════════════════════════════════════════════
+   PRICING ENGINE — European (BSM) + American (CRR Binomial Tree)
+   
+   Europeia: Black-Scholes-Merton closed-form + Monte Carlo
+   Americana: Cox-Ross-Rubinstein Binomial Tree (500 steps)
+              + Greeks via finite differences
+   
+   Theta base 252 DU (B3)
+   Taxa convertida: r_cont = ln(1 + r_anual)
+   ═══════════════════════════════════════════════════════════════════ */
+
+// ─── Normal Distribution ───
+
+function normalCDF(x) {
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
+  const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  const ax = Math.abs(x) / Math.sqrt(2);
+  const t = 1.0 / (1.0 + p * ax);
+  const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-ax * ax);
+  return 0.5 * (1.0 + sign * y);
+}
+
+function normalPDF(x) {
+  return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+}
+
+// ─── Black-Scholes-Merton (European only) ───
+
+function d1d2(S, K, T, r, sigma, q = 0) {
+  if (T <= 1e-10 || sigma <= 1e-10) return [0, 0];
+  const d1 = (Math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
+  return [d1, d1 - sigma * Math.sqrt(T)];
+}
+
+function bsmPrice(S, K, T, r, sigma, type = "call", q = 0) {
+  if (S <= 0 || K <= 0) return 0;
+  if (T <= 1e-10) return type === "call" ? Math.max(S - K, 0) : Math.max(K - S, 0);
+  if (sigma <= 1e-10) {
+    const fwd = S * Math.exp((r - q) * T), df = Math.exp(-r * T);
+    return type === "call" ? Math.max(fwd - K, 0) * df : Math.max(K - fwd, 0) * df;
+  }
+  const [d1, d2] = d1d2(S, K, T, r, sigma, q);
+  return type === "call"
+    ? S * Math.exp(-q * T) * normalCDF(d1) - K * Math.exp(-r * T) * normalCDF(d2)
+    : K * Math.exp(-r * T) * normalCDF(-d2) - S * Math.exp(-q * T) * normalCDF(-d1);
+}
+
+function bsmGreeks(S, K, T, r, sigma, type = "call", q = 0) {
+  const zero = { delta: 0, gamma: 0, theta: 0, vega: 0, rho: 0 };
+  if (S <= 0 || K <= 0 || T <= 1e-10 || sigma <= 1e-10) return zero;
+  const [d1, d2] = d1d2(S, K, T, r, sigma, q);
+  const sqT = Math.sqrt(T), eqT = Math.exp(-q * T), erT = Math.exp(-r * T), nd1 = normalPDF(d1);
+  const gamma = (nd1 * eqT) / (S * sigma * sqT);
+  const vega = S * eqT * nd1 * sqT * 0.01;
+  let delta, theta, rho;
+  if (type === "call") {
+    delta = eqT * normalCDF(d1);
+    theta = (-(S * sigma * eqT * nd1) / (2 * sqT) - r * K * erT * normalCDF(d2) + q * S * eqT * normalCDF(d1)) / 252;
+    rho = K * T * erT * normalCDF(d2) * 0.01;
+  } else {
+    delta = eqT * (normalCDF(d1) - 1);
+    theta = (-(S * sigma * eqT * nd1) / (2 * sqT) + r * K * erT * normalCDF(-d2) - q * S * eqT * normalCDF(-d1)) / 252;
+    rho = -K * T * erT * normalCDF(-d2) * 0.01;
+  }
+  return { delta, gamma, theta, vega, rho };
+}
+
+// ─── Cox-Ross-Rubinstein Binomial Tree (American + European) ───
+
+function crrPrice(S, K, T, r, sigma, type = "call", q = 0, american = true, steps = 500) {
+  if (S <= 0 || K <= 0) return 0;
+  if (T <= 1e-10) return type === "call" ? Math.max(S - K, 0) : Math.max(K - S, 0);
+  if (sigma <= 1e-10) sigma = 0.0001;
+
+  const dt = T / steps;
+  const u = Math.exp(sigma * Math.sqrt(dt));
+  const d = 1 / u;
+  const disc = Math.exp(-r * dt);
+  const p = (Math.exp((r - q) * dt) - d) / (u - d);
+  const p1 = disc * p;
+  const p2 = disc * (1 - p);
+
+  // Terminal payoffs
+  const prices = new Float64Array(steps + 1);
+  for (let i = 0; i <= steps; i++) {
+    const sT = S * Math.pow(u, steps - i) * Math.pow(d, i);
+    prices[i] = type === "call" ? Math.max(sT - K, 0) : Math.max(K - sT, 0);
+  }
+
+  // Backward induction
+  for (let j = steps - 1; j >= 0; j--) {
+    for (let i = 0; i <= j; i++) {
+      const cont = p1 * prices[i] + p2 * prices[i + 1];
+      if (american) {
+        const sNode = S * Math.pow(u, j - i) * Math.pow(d, i);
+        const exercise = type === "call" ? Math.max(sNode - K, 0) : Math.max(K - sNode, 0);
+        prices[i] = Math.max(cont, exercise);
+      } else {
+        prices[i] = cont;
+      }
+    }
+  }
+  return prices[0];
+}
+
+// ─── Greeks via Finite Differences (for American options) ───
+
+function fdGreeks(S, K, T, r, sigma, type = "call", q = 0, steps = 400) {
+  if (S <= 0 || K <= 0 || T <= 1e-10 || sigma <= 1e-10)
+    return { delta: 0, gamma: 0, theta: 0, vega: 0, rho: 0 };
+
+  const h_S = S * 0.005;       // 0.5% bump for spot
+  const h_sigma = 0.0001;      // 1bp bump for vol
+  const h_r = 0.0001;          // 1bp bump for rate
+  const h_T = 1 / 252;         // 1 business day for theta
+
+  const P0 = crrPrice(S, K, T, r, sigma, type, q, true, steps);
+  const Pu = crrPrice(S + h_S, K, T, r, sigma, type, q, true, steps);
+  const Pd = crrPrice(S - h_S, K, T, r, sigma, type, q, true, steps);
+
+  const delta = (Pu - Pd) / (2 * h_S);
+  const gamma = (Pu - 2 * P0 + Pd) / (h_S * h_S);
+
+  // Theta: preço amanhã - preço hoje (negativo = time decay)
+  const Pt = T > h_T ? crrPrice(S, K, T - h_T, r, sigma, type, q, true, steps) : P0;
+  const theta = (Pt - P0); // já é por 1 DU
+
+  // Vega per 1%
+  const Pvu = crrPrice(S, K, T, r, sigma + h_sigma, type, q, true, steps);
+  const Pvd = crrPrice(S, K, T, r, sigma - h_sigma, type, q, true, steps);
+  const vega = (Pvu - Pvd) / (2 * h_sigma) * 0.01;
+
+  // Rho per 1%
+  const Pru = crrPrice(S, K, T, r + h_r, sigma, type, q, true, steps);
+  const Prd = crrPrice(S, K, T, r - h_r, sigma, type, q, true, steps);
+  const rho = (Pru - Prd) / (2 * h_r) * 0.01;
+
+  return { delta, gamma, theta, vega, rho };
+}
+
+// ─── Monte Carlo (European) ───
+
+function monteCarlo(S, K, T, r, sigma, type = "call", q = 0, nSims = 80000) {
+  if (T <= 1e-10) return { price: type === "call" ? Math.max(S - K, 0) : Math.max(K - S, 0), se: 0 };
+  const drift = (r - q - 0.5 * sigma * sigma) * T;
+  const diff = sigma * Math.sqrt(T);
+  const half = Math.floor(nSims / 2);
+  let sum = 0, sumSq = 0;
+  for (let i = 0; i < half; i++) {
+    const u1 = Math.random(), u2 = Math.random();
+    const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    const sT1 = S * Math.exp(drift + diff * z);
+    const sT2 = S * Math.exp(drift + diff * (-z));
+    const pay1 = type === "call" ? Math.max(sT1 - K, 0) : Math.max(K - sT1, 0);
+    const pay2 = type === "call" ? Math.max(sT2 - K, 0) : Math.max(K - sT2, 0);
+    const d1 = Math.exp(-r * T) * pay1, d2 = Math.exp(-r * T) * pay2;
+    sum += d1 + d2; sumSq += d1 * d1 + d2 * d2;
+  }
+  const n = half * 2, mean = sum / n;
+  return { price: mean, se: Math.sqrt(Math.max(sumSq / n - mean * mean, 0) / n) };
+}
+
+// ─── Implied Volatility (bisection) ───
+
+function impliedVol(mktPrice, S, K, T, r, type = "call", q = 0, american = false) {
+  if (mktPrice <= 0 || T <= 1e-10 || S <= 0 || K <= 0) return 0;
+  const priceFn = american
+    ? (sig) => crrPrice(S, K, T, r, sig, type, q, true, 200)
+    : (sig) => bsmPrice(S, K, T, r, sig, type, q);
+
+  let lo = 0.001, hi = 8.0;
+  for (let i = 0; i < 300; i++) {
+    const mid = (lo + hi) / 2;
+    if (priceFn(mid) > mktPrice) hi = mid; else lo = mid;
+    if (hi - lo < 1e-9) break;
+  }
+  return (lo + hi) / 2;
+}
+
+function convertBrRate(annual) {
+  return Math.log(1 + annual);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   UNIFIED PRICER — dispatches to correct model
+   ═══════════════════════════════════════════════════════════════════ */
+
+function computeAll(S, K, T, r, sigma, type, q, style, mktPrice) {
+  const isAmerican = style === "americana";
+
+  // Main model price
+  let modelPrice, modelLabel, modelPrice2, model2Label, mcSe = 0;
+
+  if (isAmerican) {
+    modelPrice = crrPrice(S, K, T, r, sigma, type, q, true, 500);
+    modelLabel = "CRR TREE";
+    // European equivalent for early exercise premium
+    modelPrice2 = crrPrice(S, K, T, r, sigma, type, q, false, 500);
+    model2Label = "EUR (REF)";
+  } else {
+    modelPrice = bsmPrice(S, K, T, r, sigma, type, q);
+    modelLabel = "BSM";
+    const mc = monteCarlo(S, K, T, r, sigma, type, q, 80000);
+    modelPrice2 = mc.price;
+    model2Label = "M. CARLO";
+    mcSe = mc.se;
+  }
+
+  // Early exercise premium
+  const earlyExPremium = isAmerican ? modelPrice - modelPrice2 : 0;
+
+  // IV
+  const iv = impliedVol(mktPrice, S, K, T, r, type, q, isAmerican);
+
+  // Greeks
+  const gSigma = iv > 0.001 ? iv : sigma;
+  const greeks = isAmerican
+    ? fdGreeks(S, K, T, r, gSigma, type, q, 400)
+    : bsmGreeks(S, K, T, r, gSigma, type, q);
+
+  // Spread & verdict
+  const spread1 = modelPrice > 0.0001 ? ((mktPrice - modelPrice) / modelPrice) * 100 : 0;
+  const spread2 = modelPrice2 > 0.0001 ? ((mktPrice - modelPrice2) / modelPrice2) * 100 : 0;
+  const verdict = (s) => s > 5 ? "CARA" : s < -5 ? "BARATA" : "JUSTA";
+
+  return {
+    price1: modelPrice, label1: modelLabel,
+    price2: modelPrice2, label2: model2Label, mcSe,
+    earlyExPremium, iv, greeks,
+    spread1, spread2, verdict1: verdict(spread1), verdict2: verdict(spread2),
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SURFACE GENERATION — uses correct model per style
+   ═══════════════════════════════════════════════════════════════════ */
+
+function generateSurface(S, r, sigma, type, q, surfaceType, style) {
+  const nK = 42, nT = 42;
+  const isAm = style === "americana";
+  const treeSteps = 120; // lighter for surface perf
+  const strikes = [], times = [];
+  for (let i = 0; i < nK; i++) strikes.push(S * (0.70 + 0.60 * i / (nK - 1)));
+  for (let i = 0; i < nT; i++) times.push(0.01 + 1.49 * i / (nT - 1));
+
+  const z = [];
+  for (let ti = 0; ti < nT; ti++) {
+    const row = [];
+    for (let ki = 0; ki < nK; ki++) {
+      if (surfaceType === "price") {
+        row.push(isAm
+          ? crrPrice(S, strikes[ki], times[ti], r, sigma, type, q, true, treeSteps)
+          : bsmPrice(S, strikes[ki], times[ti], r, sigma, type, q));
+      } else if (surfaceType === "earlyPremium") {
+        const am = crrPrice(S, strikes[ki], times[ti], r, sigma, type, q, true, treeSteps);
+        const eu = crrPrice(S, strikes[ki], times[ti], r, sigma, type, q, false, treeSteps);
+        row.push(am - eu);
+      } else {
+        const g = isAm
+          ? fdGreeks(S, strikes[ki], times[ti], r, sigma, type, q, 80)
+          : bsmGreeks(S, strikes[ki], times[ti], r, sigma, type, q);
+        row.push(g[surfaceType] || 0);
+      }
+    }
+    z.push(row);
+  }
+  return { strikes, times, z };
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   3D PLOTLY SURFACE
+   ═══════════════════════════════════════════════════════════════════ */
+
+function Surface3D({ S, r, sigma, type, q, surfaceType, strike, T: userT, style }) {
+  const containerRef = useRef(null);
+  const plotInstanceRef = useRef(false);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const { strikes, times, z } = generateSurface(S, r, sigma, type, q, surfaceType, style);
+
+    const labelMap = {
+      price: "Preço (R$)", delta: "Delta (Δ)", gamma: "Gamma (Γ)",
+      theta: "Theta (Θ)/du", vega: "Vega (ν)/1%", rho: "Rho (ρ)/1%",
+      earlyPremium: "Prêmio Exerc. Antecipado (R$)",
+    };
+
+    const scaleMap = {
+      price: [[0,"#0c0c0c"],[0.2,"#1a1a2e"],[0.45,"#16213e"],[0.65,"#0f3460"],[0.82,"#e94560"],[1,"#f5c518"]],
+      delta: [[0,"#0c0c0c"],[0.3,"#1a1a2e"],[0.5,"#533483"],[0.75,"#e94560"],[1,"#f5c518"]],
+      gamma: [[0,"#0c0c0c"],[0.35,"#0f3460"],[0.65,"#00b4d8"],[1,"#f5c518"]],
+      theta: [[0,"#f5c518"],[0.3,"#e94560"],[0.6,"#533483"],[1,"#0c0c0c"]],
+      vega:  [[0,"#0c0c0c"],[0.3,"#16213e"],[0.6,"#00b4d8"],[1,"#90e0ef"]],
+      rho:   [[0,"#0c0c0c"],[0.4,"#1a1a2e"],[0.7,"#533483"],[1,"#e94560"]],
+      earlyPremium: [[0,"#0c0c0c"],[0.3,"#1a3a1a"],[0.6,"#2ec4b6"],[1,"#f5c518"]],
+    };
+
+    // Marker for user's option position
+    const markerTraces = [];
+    if (strike > 0 && userT > 0) {
+      let zVal = 0;
+      const isAm = style === "americana";
+      if (surfaceType === "price") {
+        zVal = isAm ? crrPrice(S, strike, userT, r, sigma, type, q, true, 300) : bsmPrice(S, strike, userT, r, sigma, type, q);
+      } else if (surfaceType === "earlyPremium") {
+        zVal = crrPrice(S, strike, userT, r, sigma, type, q, true, 300) - crrPrice(S, strike, userT, r, sigma, type, q, false, 300);
+      } else {
+        const g = isAm ? fdGreeks(S, strike, userT, r, sigma, type, q, 200) : bsmGreeks(S, strike, userT, r, sigma, type, q);
+        zVal = g[surfaceType] || 0;
+      }
+      markerTraces.push({
+        type: "scatter3d", mode: "markers",
+        x: [strike], y: [Math.min(Math.max(userT, 0.01), 1.5)], z: [zVal],
+        marker: { size: 6, color: "#f5c518", symbol: "diamond", line: { color: "#fff", width: 1 } },
+        hovertemplate: `<b>SUA OPÇÃO</b><br>K: R$${strike.toFixed(2)}<br>T: ${userT.toFixed(3)}a<br>${labelMap[surfaceType]}: ${zVal.toFixed(4)}<extra></extra>`,
+        showlegend: false,
+      });
+    }
+
+    const axisStyle = {
+      gridcolor: "rgba(245,197,24,0.06)", color: "#666",
+      backgroundcolor: "rgba(0,0,0,0)", showbackground: false,
+      zerolinecolor: "rgba(245,197,24,0.1)",
+    };
+
+    const data = [{
+      type: "surface", x: strikes, y: times, z: z,
+      colorscale: scaleMap[surfaceType] || scaleMap.price,
+      showscale: false,
+      contours: { z: { show: true, usecolormap: true, highlightcolor: "rgba(245,197,24,0.3)", project: { z: false } } },
+      lighting: { ambient: 0.75, diffuse: 0.55, specular: 0.15, roughness: 0.7, fresnel: 0.2 },
+      opacity: 0.93,
+      hovertemplate: `K: R$%{x:.2f}<br>T: %{y:.3f}a<br>${labelMap[surfaceType]}: %{z:.4f}<extra></extra>`,
+    }, ...markerTraces];
+
+    const layout = {
+      scene: {
+        xaxis: { ...axisStyle, title: { text: "Strike (R$)", font: { color: "#888", size: 10, family: "DM Mono, monospace" } } },
+        yaxis: { ...axisStyle, title: { text: "Tempo (anos)", font: { color: "#888", size: 10, family: "DM Mono, monospace" } } },
+        zaxis: { ...axisStyle, title: { text: labelMap[surfaceType], font: { color: "#888", size: 10, family: "DM Mono, monospace" } } },
+        bgcolor: "rgba(0,0,0,0)",
+        camera: { eye: { x: 1.55, y: -1.65, z: 0.85 } },
+      },
+      paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+      margin: { l: 0, r: 0, t: 0, b: 0 },
+      hoverlabel: { bgcolor: "#111", bordercolor: "#f5c518", font: { color: "#eee", family: "DM Mono, monospace", size: 11 } },
+    };
+
+    if (plotInstanceRef.current) {
+      Plotly.react(containerRef.current, data, layout, { responsive: true, displayModeBar: false, scrollZoom: true });
+    } else {
+      Plotly.newPlot(containerRef.current, data, layout, { responsive: true, displayModeBar: false, scrollZoom: true });
+      plotInstanceRef.current = true;
+    }
+    return () => { if (containerRef.current) { try { Plotly.purge(containerRef.current); } catch(e) {} } plotInstanceRef.current = false; };
+  }, [S, r, sigma, type, q, surfaceType, strike, userT, style]);
+
+  return <div ref={containerRef} style={{ width: "100%", height: "100%" }} />;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   UI COMPONENTS
+   ═══════════════════════════════════════════════════════════════════ */
+
+const Pill = ({ children, active, onClick }) => (
+  <button onClick={onClick} style={{
+    padding: "5px 12px", fontSize: 11, fontFamily: "'DM Mono', monospace",
+    borderRadius: 4, border: "none", cursor: "pointer", fontWeight: 500,
+    letterSpacing: 0.5, transition: "all 0.2s ease",
+    background: active ? "rgba(245,197,24,0.12)" : "transparent",
+    color: active ? "#f5c518" : "#555",
+  }}>{children}</button>
+);
+
+const StyleToggle = ({ value, onChange }) => (
+  <div style={{
+    display: "flex", background: "#0a0a0a", borderRadius: 6, padding: 3,
+    border: "1px solid #1a1a1a", gap: 2,
+  }}>
+    {[
+      { key: "europeia", label: "EUROPEIA", icon: "EU" },
+      { key: "americana", label: "AMERICANA", icon: "US" },
+    ].map(opt => (
+      <button key={opt.key} onClick={() => onChange(opt.key)} style={{
+        flex: 1, padding: "8px 6px", borderRadius: 4, border: "none",
+        cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 10,
+        fontWeight: 600, letterSpacing: 1.5, transition: "all 0.25s ease",
+        background: value === opt.key
+          ? (opt.key === "europeia" ? "rgba(10,132,255,0.12)" : "rgba(233,69,96,0.12)")
+          : "transparent",
+        color: value === opt.key
+          ? (opt.key === "europeia" ? "#0A84FF" : "#e94560")
+          : "#444",
+      }}>
+        <span style={{ fontSize: 8, display: "block", marginBottom: 2, opacity: 0.6 }}>{opt.icon}</span>
+        {opt.label}
+      </button>
+    ))}
+  </div>
+);
+
+const Metric = ({ label, value, unit, color, small }) => (
+  <div style={{ padding: small ? "8px 10px" : "12px 14px", background: "#111", borderRadius: 8, borderLeft: `2px solid ${color || "#222"}` }}>
+    <div style={{ fontSize: 10, color: "#555", letterSpacing: 1.2, marginBottom: 4, fontFamily: "'DM Mono', monospace" }}>{label}</div>
+    <div style={{ display: "flex", alignItems: "baseline", gap: 3 }}>
+      <span style={{ fontSize: small ? 15 : 20, fontWeight: 600, color: color || "#ddd", fontFamily: "'DM Mono', monospace" }}>{value}</span>
+      {unit && <span style={{ fontSize: 10, color: "#555" }}>{unit}</span>}
+    </div>
+  </div>
+);
+
+const Sep = () => <div style={{ height: 1, background: "linear-gradient(90deg, transparent, #222, transparent)", margin: "14px 0" }} />;
+
+/* ═══════════════════════════════════════════════════════════════════
+   MAIN APP
+   ═══════════════════════════════════════════════════════════════════ */
+
+export default function App() {
+  const [ticker, setTicker] = useState("PETR4");
+  const [spot, setSpot] = useState(36.80);
+  const [strike, setStrike] = useState(38.50);
+  const [expiry, setExpiry] = useState("2026-06-15");
+  const [rateAnnual, setRateAnnual] = useState(14.75);
+  const [vol, setVol] = useState(38);
+  const [optType, setOptType] = useState("call");
+  const [mktPrice, setMktPrice] = useState(2.15);
+  const [divYield, setDivYield] = useState(10);
+  const [surfaceType, setSurfaceType] = useState("price");
+  const [optStyle, setOptStyle] = useState("europeia");
+  const [computed, setComputed] = useState(null);
+  const [computing, setComputing] = useState(false);
+  const [showGuide, setShowGuide] = useState(false);
+
+  const T = useMemo(() => Math.max((new Date(expiry).getTime() - Date.now()) / (1000 * 86400 * 365), 1 / 365), [expiry]);
+  const daysLeft = useMemo(() => Math.max(Math.round((new Date(expiry) - new Date()) / 86400000), 0), [expiry]);
+  const r = useMemo(() => convertBrRate(rateAnnual / 100), [rateAnnual]);
+  const q = useMemo(() => convertBrRate(divYield / 100), [divYield]);
+  const sigma = vol / 100;
+  const isAmerican = optStyle === "americana";
+
+  const compute = useCallback(() => {
+    setComputing(true);
+    requestAnimationFrame(() => {
+      const result = computeAll(spot, strike, T, r, sigma, optType, q, optStyle, mktPrice);
+      setComputed(result);
+      setComputing(false);
+    });
+  }, [spot, strike, T, r, sigma, optType, q, mktPrice, optStyle]);
+
+  useEffect(() => { compute(); }, []);
+
+  // When style changes, reset surface if needed
+  useEffect(() => {
+    if (surfaceType === "earlyPremium" && !isAmerican) setSurfaceType("price");
+  }, [optStyle]);
+
+  const vc = (v) => v === "CARA" ? "#e94560" : v === "BARATA" ? "#2ec4b6" : "#666";
+  const moneyness = spot > 0 ? ((spot - strike) / spot * 100) : 0;
+  const mLabel = optType === "call"
+    ? (moneyness > 2 ? "ITM" : moneyness < -2 ? "OTM" : "ATM")
+    : (moneyness < -2 ? "ITM" : moneyness > 2 ? "OTM" : "ATM");
+
+  const inputDefs = [
+    { id: "ticker", label: "Ativo", val: ticker, set: setTicker, type: "text" },
+    { id: "spot", label: "Spot (R$)", val: spot, set: v => setSpot(+v), type: "number", step: "0.01" },
+    { id: "strike", label: "Strike (R$)", val: strike, set: v => setStrike(+v), type: "number", step: "0.01" },
+    { id: "mkt", label: "Preço Tela (R$)", val: mktPrice, set: v => setMktPrice(+v), type: "number", step: "0.01" },
+    { id: "rate", label: "Risk-Free (% a.a.)", val: rateAnnual, set: v => setRateAnnual(+v), type: "number", step: "0.01" },
+    { id: "vol", label: "Vol Histórica (%)", val: vol, set: v => setVol(+v), type: "number", step: "0.1" },
+    { id: "div", label: "Div Yield (%)", val: divYield, set: v => setDivYield(+v), type: "number", step: "0.1" },
+  ];
+
+  const surfTabs = isAmerican
+    ? ["price", "earlyPremium", "delta", "gamma", "theta", "vega"]
+    : ["price", "delta", "gamma", "theta", "vega", "rho"];
+
+  const surfLabels = {
+    price: "Preço", delta: "Delta", gamma: "Gamma", theta: "Theta",
+    vega: "Vega", rho: "Rho", earlyPremium: "Prêmio Ex.",
+  };
+
+  return (
+    <div style={ST.root}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Sans:wght@400;500;600;700&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0}
+        input[type=number]{-moz-appearance:textfield}
+        input::-webkit-outer-spin-button,input::-webkit-inner-spin-button{-webkit-appearance:none}
+        ::-webkit-scrollbar{width:4px}
+        ::-webkit-scrollbar-track{background:#0a0a0a}
+        ::-webkit-scrollbar-thumb{background:#222;border-radius:2px}
+        .fi{display:flex;flex-direction:column;gap:5px}
+        .fi label{font-size:10px;color:#555;letter-spacing:1.2px;font-family:'DM Mono',monospace;text-transform:uppercase}
+        .fi input,.fi select{
+          background:#0e0e0e;border:1px solid #1a1a1a;color:#ccc;padding:9px 11px;
+          border-radius:5px;font-family:'DM Mono',monospace;font-size:13px;
+          outline:none;transition:border-color 0.25s ease;
+        }
+        .fi input:focus,.fi select:focus{border-color:#f5c518}
+        .fi select option{background:#0e0e0e;color:#ccc}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}
+        @keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+      `}</style>
+
+      {/* ─── HEADER ─── */}
+      <header style={ST.header}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <div style={ST.logo}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f5c518" strokeWidth="2.5">
+              <polyline points="22 7 13.5 15.5 8.5 10.5 2 17" /><polyline points="16 7 22 7 22 13" />
+            </svg>
+          </div>
+          <div>
+            <h1 style={ST.title}>Derivatives Pricing</h1>
+            <p style={ST.subtitle}>
+              {isAmerican ? "Binomial CRR" : "Black-Scholes-Merton"} · Monte Carlo · B3
+            </p>
+          </div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          {/* STYLE BADGE */}
+          <div style={{
+            padding: "4px 12px", borderRadius: 4, fontSize: 10, fontWeight: 600,
+            fontFamily: "'DM Mono', monospace", letterSpacing: 1.5,
+            background: isAmerican ? "rgba(233,69,96,0.1)" : "rgba(10,132,255,0.1)",
+            color: isAmerican ? "#e94560" : "#0A84FF",
+            border: `1px solid ${isAmerican ? "rgba(233,69,96,0.2)" : "rgba(10,132,255,0.2)"}`,
+          }}>
+            {isAmerican ? "AMERICANA" : "EUROPEIA"}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#555", fontFamily: "'DM Mono', monospace" }}>
+            <div style={{ width: 5, height: 5, borderRadius: "50%", background: "#2ec4b6", animation: "blink 2.5s infinite" }} />
+            READY
+          </div>
+        </div>
+      </header>
+
+      {/* ─── GRID ─── */}
+      <div style={ST.grid}>
+
+        {/* ▌LEFT — INPUTS */}
+        <div style={ST.panel}>
+          <div style={ST.secHead}>
+            <span style={{ color: "#f5c518", fontSize: 10 }}>01</span>
+            <span>PARÂMETROS</span>
+          </div>
+
+          {/* STYLE SELECTOR */}
+          <StyleToggle value={optStyle} onChange={setOptStyle} />
+
+          {isAmerican && (
+            <div style={{
+              marginTop: 8, padding: "8px 10px", background: "rgba(233,69,96,0.05)",
+              border: "1px solid rgba(233,69,96,0.15)", borderRadius: 6,
+              fontSize: 10, color: "#888", fontFamily: "'DM Mono', monospace", lineHeight: 1.6,
+            }}>
+              <span style={{ color: "#e94560" }}>Americana</span> — exercício antecipado permitido.
+              Modelo: <b style={{ color: "#ccc" }}>CRR Binomial Tree</b> (500 steps).
+              Gregas via <b style={{ color: "#ccc" }}>diferenças finitas</b>.
+            </div>
+          )}
+
+          <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            {inputDefs.map(d => (
+              <div className="fi" key={d.id}>
+                <label>{d.label}</label>
+                <input type={d.type} step={d.step} value={d.val}
+                  onChange={e => d.set(d.type === "text" ? e.target.value : e.target.value)} />
+              </div>
+            ))}
+            <div className="fi">
+              <label>Tipo</label>
+              <select value={optType} onChange={e => setOptType(e.target.value)}>
+                <option value="call">CALL</option>
+                <option value="put">PUT</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="fi" style={{ marginTop: 10 }}>
+            <label>Vencimento</label>
+            <input type="date" value={expiry} onChange={e => setExpiry(e.target.value)} />
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginTop: 10, fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#444", flexWrap: "wrap" }}>
+            <span style={{ background: "#111", padding: "4px 8px", borderRadius: 4 }}>{daysLeft} dias</span>
+            <span style={{ background: "#111", padding: "4px 8px", borderRadius: 4 }}>T = {T.toFixed(4)}a</span>
+            <span style={{
+              background: mLabel === "ITM" ? "rgba(46,196,178,0.1)" : mLabel === "OTM" ? "rgba(233,69,96,0.1)" : "#111",
+              color: mLabel === "ITM" ? "#2ec4b6" : mLabel === "OTM" ? "#e94560" : "#666",
+              padding: "4px 8px", borderRadius: 4
+            }}>{mLabel}</span>
+          </div>
+
+          <Sep />
+
+          <button onClick={() => setShowGuide(!showGuide)} style={{
+            background: "none", border: "1px solid #1a1a1a", borderRadius: 5, padding: "8px 12px",
+            color: "#555", fontSize: 10, cursor: "pointer", fontFamily: "'DM Mono', monospace",
+            letterSpacing: 1, width: "100%", textAlign: "left",
+          }}>
+            {showGuide ? "▾" : "▸"} GUIA TAXA LIVRE DE RISCO 🇧🇷
+          </button>
+          {showGuide && (
+            <div style={{
+              background: "#0a0a0a", border: "1px solid #1a1a1a", borderRadius: 6, padding: 12, marginTop: 8,
+              fontSize: 10, lineHeight: 1.8, color: "#555", fontFamily: "'DM Mono', monospace", animation: "fadeUp 0.3s ease"
+            }}>
+              <div style={{ color: "#f5c518", marginBottom: 6 }}>HIERARQUIA DE FONTES</div>
+              <b style={{ color: "#888" }}>① DI Futuro (DI1F)</b> — ideal, interpole para o prazo<br />
+              <span style={{ color: "#444" }}>   r = (100k/PU)^(252/DU) - 1</span><br />
+              <b style={{ color: "#888" }}>② CDI / Selic Meta</b> — bom para curto prazo<br />
+              <b style={{ color: "#888" }}>③ Tesouro LTN</b> — pré-fixado, médio/longo<br />
+              <b style={{ color: "#888" }}>④ Swap Pré×DI</b> — vértices 30d, 60d, 90d...<br />
+              <Sep />
+              <span style={{ color: "#e94560" }}>BSM usa taxa contínua:</span><br />
+              <span style={{ color: "#888" }}>r_cont = ln(1 + r_anual)</span><br />
+              <span style={{ color: "#444" }}>Conversão automática neste sistema</span>
+            </div>
+          )}
+
+          <Sep />
+
+          <button onClick={compute} disabled={computing} style={{ ...ST.btn, opacity: computing ? 0.5 : 1 }}>
+            {computing ? "PROCESSANDO..." : "CALCULAR"}
+          </button>
+        </div>
+
+        {/* ▌CENTER — 3D SURFACE */}
+        <div style={{ ...ST.panel, display: "flex", flexDirection: "column", padding: 0, overflow: "hidden" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 18px 6px", flexWrap: "wrap", gap: 8 }}>
+            <div style={ST.secHead}>
+              <span style={{ color: "#f5c518", fontSize: 10 }}>02</span>
+              <span>SUPERFÍCIE {isAmerican ? "(AMERICANA)" : "(EUROPEIA)"}</span>
+            </div>
+            <div style={{ display: "flex", gap: 2, background: "#0e0e0e", padding: 3, borderRadius: 5, flexWrap: "wrap" }}>
+              {surfTabs.map(k => (
+                <Pill key={k} active={surfaceType === k} onClick={() => setSurfaceType(k)}>
+                  {surfLabels[k]}
+                </Pill>
+              ))}
+            </div>
+          </div>
+          <div style={{ flex: 1, minHeight: 0, background: "radial-gradient(ellipse at 50% 80%, #0a0a12, #080808)" }}>
+            <Surface3D S={spot} r={r} sigma={sigma} type={optType} q={q}
+              surfaceType={surfaceType} strike={strike} T={T} style={optStyle} />
+          </div>
+          <div style={{ padding: "6px 18px 10px", display: "flex", justifyContent: "space-between", fontSize: 10, fontFamily: "'DM Mono', monospace", color: "#333" }}>
+            <span>◆ = Sua opção · {isAmerican ? "Modelo: CRR Binomial" : "Modelo: BSM analítico"}</span>
+            <span>{ticker} · {optType.toUpperCase()} · K={strike.toFixed(2)} · σ={vol}%</span>
+          </div>
+        </div>
+
+        {/* ▌RIGHT — RESULTS */}
+        <div style={ST.panel}>
+          <div style={ST.secHead}>
+            <span style={{ color: "#f5c518", fontSize: 10 }}>03</span>
+            <span>ANÁLISE</span>
+          </div>
+
+          {computed && (
+            <div style={{ animation: "fadeUp 0.35s ease" }}>
+
+              {/* VERDICT */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 0", borderBottom: "1px solid #1a1a1a" }}>
+                <div>
+                  <div style={{ fontSize: 10, color: "#444", letterSpacing: 1.5, fontFamily: "'DM Mono', monospace", marginBottom: 4 }}>
+                    VEREDITO {computed.label1}
+                  </div>
+                  <div style={{ fontSize: 26, fontWeight: 700, color: vc(computed.verdict1), fontFamily: "'Instrument Sans', sans-serif" }}>
+                    {computed.verdict1}
+                  </div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 10, color: "#444", letterSpacing: 1, fontFamily: "'DM Mono', monospace", marginBottom: 4 }}>SPREAD</div>
+                  <div style={{ fontSize: 22, fontFamily: "'DM Mono', monospace", fontWeight: 500, color: vc(computed.verdict1) }}>
+                    {computed.spread1 > 0 ? "+" : ""}{computed.spread1.toFixed(2)}%
+                  </div>
+                </div>
+              </div>
+
+              {/* PRICES */}
+              <div style={{ marginTop: 14 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                  <Metric label="MERCADO" value={`${mktPrice.toFixed(2)}`} color="#888" />
+                  <Metric label={computed.label1} value={`${computed.price1.toFixed(2)}`} color="#f5c518" />
+                  <Metric label={computed.label2} value={`${computed.price2.toFixed(2)}`} color="#00b4d8" />
+                </div>
+                {computed.mcSe > 0 && (
+                  <div style={{ fontSize: 9, color: "#333", marginTop: 4, fontFamily: "'DM Mono', monospace", textAlign: "right" }}>
+                    MC erro padrão: ±{computed.mcSe.toFixed(4)}
+                  </div>
+                )}
+              </div>
+
+              {/* EARLY EXERCISE PREMIUM */}
+              {isAmerican && (
+                <>
+                  <Sep />
+                  <div style={{
+                    padding: "12px 14px", borderRadius: 8,
+                    background: computed.earlyExPremium > 0.001 ? "rgba(245,197,24,0.05)" : "#111",
+                    border: computed.earlyExPremium > 0.001 ? "1px solid rgba(245,197,24,0.15)" : "1px solid #1a1a1a",
+                  }}>
+                    <div style={{ fontSize: 10, color: "#555", letterSpacing: 1.2, marginBottom: 6, fontFamily: "'DM Mono', monospace" }}>
+                      PRÊMIO DE EXERCÍCIO ANTECIPADO
+                    </div>
+                    <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                      <span style={{
+                        fontSize: 22, fontWeight: 700, fontFamily: "'DM Mono', monospace",
+                        color: computed.earlyExPremium > 0.001 ? "#f5c518" : "#444",
+                      }}>
+                        R${computed.earlyExPremium.toFixed(4)}
+                      </span>
+                      {computed.price1 > 0.001 && (
+                        <span style={{ fontSize: 11, color: "#555" }}>
+                          ({(computed.earlyExPremium / computed.price1 * 100).toFixed(2)}% do preço)
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 10, color: "#444", marginTop: 6, fontFamily: "'DM Mono', monospace" }}>
+                      {computed.earlyExPremium > 0.01
+                        ? "Exercício antecipado tem valor — considere na análise"
+                        : "Exercício antecipado irrelevante — europeia ≈ americana"}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              <Sep />
+
+              {/* VOLATILITY */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                <Metric label="VOL HISTÓRICA" value={`${vol.toFixed(1)}`} unit="%" color="#f5c518" small />
+                <Metric label="VOL IMPLÍCITA" value={`${(computed.iv * 100).toFixed(1)}`} unit="%"
+                  color={computed.iv > sigma ? "#e94560" : "#2ec4b6"} small />
+              </div>
+              <div style={{ fontSize: 10, color: "#444", marginTop: 6, fontFamily: "'DM Mono', monospace" }}>
+                Spread vol: <span style={{ color: (computed.iv - sigma) > 0 ? "#e94560" : "#2ec4b6" }}>
+                  {((computed.iv - sigma) * 100).toFixed(2)}%
+                </span>
+                {computed.iv > sigma
+                  ? <span style={{ color: "#555" }}> — mercado precifica mais risco</span>
+                  : <span style={{ color: "#555" }}> — mercado precifica menos risco</span>}
+              </div>
+
+              <Sep />
+
+              {/* GREEKS */}
+              <div style={ST.secHead}>
+                <span style={{ color: "#f5c518", fontSize: 10 }}>Δ</span>
+                <span>GREGAS {isAmerican ? "(FD)" : "(ANALÍTICAS)"}</span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 8 }}>
+                {[
+                  { l: "Delta (Δ)", v: computed.greeks.delta, c: "#f5c518", f: 4 },
+                  { l: "Gamma (Γ)", v: computed.greeks.gamma, c: "#00b4d8", f: 5 },
+                  { l: "Theta (Θ)", v: computed.greeks.theta, c: "#e94560", f: 5, u: "/du" },
+                  { l: "Vega (ν)", v: computed.greeks.vega, c: "#2ec4b6", f: 5, u: "/1%" },
+                  { l: "Rho (ρ)", v: computed.greeks.rho, c: "#533483", f: 5, u: "/1%" },
+                ].map(g => (
+                  <Metric key={g.l} label={g.l}
+                    value={`${g.v >= 0 ? "+" : ""}${g.v.toFixed(g.f)}`}
+                    unit={g.u} color={g.c} small />
+                ))}
+              </div>
+
+              <Sep />
+
+              {/* PARAMS */}
+              <div style={{ fontSize: 10, color: "#333", fontFamily: "'DM Mono', monospace", lineHeight: 1.8 }}>
+                Modelo: {isAmerican ? "CRR Binomial (500 steps)" : "BSM closed-form"}<br />
+                r_cont = {(r * 100).toFixed(2)}% · q_cont = {(q * 100).toFixed(2)}%<br />
+                T = {T.toFixed(4)} anos · {daysLeft} dias · ~{(daysLeft * 252 / 365).toFixed(0)} DU
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════ */
+
+const ST = {
+  root: { background: "#0a0a0a", minHeight: "100vh", padding: "20px 24px", fontFamily: "'Instrument Sans', sans-serif", color: "#ccc" },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: 16, borderBottom: "1px solid #151515", marginBottom: 20 },
+  logo: { width: 38, height: 38, borderRadius: 8, border: "1px solid #f5c518", display: "flex", alignItems: "center", justifyContent: "center" },
+  title: { fontSize: 17, fontWeight: 700, color: "#eee", letterSpacing: 0.5 },
+  subtitle: { fontSize: 11, color: "#444", fontFamily: "'DM Mono', monospace", marginTop: 2, letterSpacing: 0.5 },
+  grid: { display: "grid", gridTemplateColumns: "280px 1fr 320px", gap: 16, height: "calc(100vh - 110px)" },
+  panel: { background: "#0e0e0e", borderRadius: 10, padding: 18, border: "1px solid #151515", overflowY: "auto" },
+  secHead: { display: "flex", alignItems: "center", gap: 8, marginBottom: 14, fontSize: 11, fontWeight: 600, letterSpacing: 2, color: "#555", fontFamily: "'DM Mono', monospace" },
+  btn: { width: "100%", padding: "13px 0", border: "1px solid #f5c518", borderRadius: 6, background: "rgba(245,197,24,0.06)", color: "#f5c518", fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 500, letterSpacing: 3, cursor: "pointer", transition: "all 0.25s ease" },
+};
