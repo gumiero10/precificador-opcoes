@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import Plotly from "plotly.js-dist-min";
+import optionsB3Raw from "./optionsB3.json";
 
 /* ═══════════════════════════════════════════════════════════════════════
    PRICING ENGINE v3.5 — VINICIN GOAT (Pure JS Speed + Pro UI)
@@ -161,41 +162,63 @@ function computeAll(S, K, T, r, sig, type, q, style, mkt) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   SCREENER DATA
+   DADOS REAIS B3
    ═══════════════════════════════════════════════════════════════════════ */
-const TICKERS = ["ABEV3", "AZUL4", "B3SA3", "BBAS3", "BBDC4", "BBSE3", "BOVA11", "BRAP4", "BRFS3", "CMIG4", "COGN3", "CSNA3", "CYRE3", "EGIE3", "ELET3", "EMBR3", "EQTL3", "GGBR4", "HAPV3", "HYPE3", "IRBR3", "ITSA4", "ITUB4", "JBSS3", "KLBN11", "LREN3", "MGLU3", "MULT3", "PETR3", "PETR4", "PRIO3", "RADL3", "RAIL3", "RDOR3", "RENT3", "SBSP3", "SUZB3", "TAEE11", "TIMS3", "UGPA3", "USIM5", "VALE3", "VIVT3", "WEGE3"].sort();
-const EXPIRIES = ["2026-03-20", "2026-04-17", "2026-05-15", "2026-06-19", "2026-07-17", "2026-08-21", "2026-09-18", "2026-10-16", "2026-11-20", "2026-12-18"];
+
+// Enriquece com dias calculados dinamicamente
+const _today = new Date(); _today.setHours(0, 0, 0, 0);
+const optionsB3 = optionsB3Raw.map(o => ({
+  ...o,
+  dias: Math.max(0, Math.round((new Date(o.venc + "T00:00:00") - _today) / 86400000)),
+})).filter(o => o.dias > 0);
+
+// Lookup por ativoObj (ex: "PETR4")
+const B3_BY_ATIVO = {};
+optionsB3.forEach(o => {
+  if (!B3_BY_ATIVO[o.ativoObj]) B3_BY_ATIVO[o.ativoObj] = [];
+  B3_BY_ATIVO[o.ativoObj].push(o);
+});
+
+// Lista de ativos disponíveis (com opções reais)
+const TICKERS = [...new Set(optionsB3.map(o => o.ativoObj))].sort();
+
 const R0 = convertBrRate(0.1475);
 const VOL0 = 0.35;
 
 function initSpots() {
-  const s = {}; TICKERS.forEach(t => s[t] = Math.round((Math.random() * 50 + 8) * 100) / 100);
-  s.PETR4 = 36.80; s.VALE3 = 62.50; s.ITUB4 = 33.20; s.BBDC4 = 13.80; s.BOVA11 = 125.00; s.WEGE3 = 52.40;
+  const s = {};
+  TICKERS.forEach(t => s[t] = Math.round((Math.random() * 50 + 8) * 100) / 100);
+  s.PETR4 = 36.80; s.VALE3 = 62.50; s.ITUB4 = 33.20; s.BBDC4 = 13.80; s.WEGE3 = 52.40;
   return s;
 }
 
+// Gera chain com tickers e strikes REAIS da B3, fair value calculado por BSM
 function genChain(und, spot) {
-  const opts = [], pfx = und.substring(0, 4);
-  const strikes = [spot * 0.92, spot * 0.96, spot, spot * 1.04, spot * 1.08].map(v => Math.round(v * 2) / 2);
-  EXPIRIES.forEach(exp => {
-    const T = Math.max((new Date(exp) - new Date()) / (1000 * 86400 * 365), 1 / 365);
-    strikes.forEach(K => {
-      ["call", "put"].forEach(tp => {
-        const fair = bsmPrice(spot, K, T, R0, VOL0, tp);
-        const sprd = (Math.random() * 0.04) + 0.01;
-        const bid = Math.max(0.01, fair * (1 - sprd)), ask = Math.max(0.02, fair * (1 + sprd));
-        const mc = new Date(exp).getMonth();
-        const letter = tp === "call" ? String.fromCharCode(65 + mc) : String.fromCharCode(77 + mc);
-        opts.push({
-          ticker: `${pfx}${letter}${Math.round(K * 10)}`, type: tp, strike: K, expiry: exp, underlying: und, spot,
-          bid, ask, last: (bid + ask) / 2, prevLast: (bid + ask) / 2, fairValue: fair,
-          delta: bsmGreeks(spot, K, T, R0, VOL0, tp).delta,
-          time: new Date().toLocaleTimeString("pt-BR"), vol: VOL0 * 100
-        });
-      });
-    });
+  const opts = B3_BY_ATIVO[und] || [];
+  return opts.map(o => {
+    const T = Math.max(o.dias / 365, 1 / 365);
+    const fair = o.estilo === "americana"
+      ? crrPrice(spot, o.strike, T, R0, VOL0, o.tipo, 0, true, 100)
+      : bsmPrice(spot, o.strike, T, R0, VOL0, o.tipo);
+    const sprd = (Math.random() * 0.04) + 0.01;
+    const bid = Math.max(0.01, fair * (1 - sprd)), ask = Math.max(0.02, fair * (1 + sprd));
+    return {
+      ticker: o.ticker,
+      type: o.tipo,
+      strike: o.strike,
+      expiry: o.venc,
+      underlying: und,
+      spot,
+      bid, ask,
+      last: (bid + ask) / 2,
+      prevLast: (bid + ask) / 2,
+      fairValue: fair,
+      delta: (o.estilo === "americana" ? fdGreeks : bsmGreeks)(spot, o.strike, T, R0, VOL0, o.tipo).delta,
+      time: new Date().toLocaleTimeString("pt-BR"),
+      vol: VOL0 * 100,
+      estilo: o.estilo,
+    };
   });
-  return opts;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -553,6 +576,12 @@ export default function App() {
 
   const filteredChain = useMemo(() => chain.filter(o => (expF === "ALL" || o.expiry === expF) && (typeF === "ALL" || o.type === typeF)), [chain, expF, typeF]);
 
+  // Vencimentos disponíveis para o ativo selecionado (dados reais)
+  const ativoExpiries = useMemo(() => {
+    const opts = B3_BY_ATIVO[asset] || [];
+    return [...new Set(opts.map(o => o.venc))].sort();
+  }, [asset]);
+
   const currentSpot = spots.current[asset] || 0;
   const surfTabs = isAm ? ["price", "earlyPremium", "delta", "gamma", "theta", "vega"] : ["price", "delta", "gamma", "theta", "vega", "rho"];
   const surfLab = { price: "Preço", delta: "Delta", gamma: "Gamma", theta: "Theta", vega: "Vega", rho: "Rho", earlyPremium: "Prêm.Ex." };
@@ -632,7 +661,7 @@ export default function App() {
 
             <select value={expF} onChange={e => setExpF(e.target.value)} style={{ background: "#111", border: "1px solid #222", color: "#ccc", padding: "7px 12px", borderRadius: 5, fontFamily: "'DM Mono',monospace", fontSize: 12, outline: "none" }}>
               <option value="ALL">Todos Vencimentos</option>
-              {EXPIRIES.map(e => <option key={e} value={e}>{e}</option>)}
+              {ativoExpiries.map(e => <option key={e} value={e}>{e}</option>)}
             </select>
 
             <div style={{ display: "flex", gap: 2, background: "#111", padding: 3, borderRadius: 5 }}>
